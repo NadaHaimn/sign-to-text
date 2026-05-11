@@ -1,7 +1,7 @@
-fastapi
-uvicorn[standard]
-tensorflow==2.16.1
-opencv-python-headless
-python-multipart
-numpy==1.26.4
-mediapipe
+fastapi>=0.115.0
+uvicorn>=0.30.0
+tensorflow>=2.20.0
+opencv-python-headless>=4.10.0
+python-multipart>=0.0.9
+mediapipe>=0.10.18
+numpy>=1.26.0
