@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y \
     libgl1 \
     libgles2 \
     libxcb1 \
+    libegl1 \
+    libxext6 \
+    libx11-6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
