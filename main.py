@@ -1,12 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 import tempfile
 import os
 
 # Reduce TensorFlow verbose logs when modules import TF. Set before importing `predict`.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-from predict import predict_video
+from predict import predict_video, get_model
+from utils import preload_landmarker_assets
 
 app = FastAPI(
     title="Sign-to-Text API",
@@ -16,6 +18,12 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+
+
+@app.on_event("startup")
+async def warm_up_model():
+    await run_in_threadpool(get_model)
+    await run_in_threadpool(preload_landmarker_assets)
 
 
 @app.post("/predict")
@@ -28,7 +36,7 @@ async def predict_endpoint(file: UploadFile = File(...)):
         tmp.write(content)
         tmp_path = tmp.name
     try:
-        result = predict_video(tmp_path)
+        result = await run_in_threadpool(predict_video, tmp_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:

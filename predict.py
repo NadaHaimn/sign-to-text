@@ -41,18 +41,32 @@ def get_model():
     global _MODEL
     if _MODEL is None:
         model_path = find_model_path()
-        _MODEL = load_model(model_path)
+        _MODEL = load_model(model_path, compile=False)
     return _MODEL
+
+
+def _build_model_inputs(model, sequence_batch):
+    if len(getattr(model, "inputs", [])) != 1:
+        return sequence_batch
+
+    input_tensor = model.inputs[0]
+    input_name = getattr(input_tensor, "name", "")
+    if not input_name:
+        return sequence_batch
+
+    input_key = input_name.split(":", 1)[0].split("/", 1)[-1]
+    return {input_key: sequence_batch}
 
 def predict_video(video_path):
     model = get_model()
-    sequence = extract_landmark_sequence(video_path)
+    sequence = extract_landmark_sequence(video_path, max_frames=12, frame_stride=8, max_side=320)
     expected_shape = tuple(model.input_shape[1:])
     if sequence.shape != expected_shape:
         raise ValueError(f"Expected input shape {expected_shape}, got {sequence.shape}")
 
     x = np.expand_dims(sequence, 0)
-    preds = model.predict(x)
+    model_inputs = _build_model_inputs(model, x)
+    preds = model(model_inputs, training=False).numpy()
     if preds.ndim == 2:
         idx = int(preds[0].argmax())
         score = float(preds[0, idx])

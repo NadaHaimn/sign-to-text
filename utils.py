@@ -1,6 +1,8 @@
+import atexit
 import os
 import json
 import urllib.request
+import threading
 import cv2
 import numpy as np
 
@@ -15,6 +17,11 @@ except Exception:  # pragma: no cover - handled at runtime with a clear error
 
 HAND_TASK_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 POSE_TASK_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+
+_HAND_LANDMARKER = None
+_POSE_LANDMARKER = None
+_LANDMARKER_LOCK = threading.Lock()
+_LANDMARKER_CLEANUP_REGISTERED = False
 
 def load_label_map(data_dir=None):
     if data_dir is None:
@@ -110,6 +117,60 @@ def _ensure_task_file(url, path):
     return path
 
 
+def _close_landmarkers():
+    global _HAND_LANDMARKER, _POSE_LANDMARKER
+
+    for landmarker in (_HAND_LANDMARKER, _POSE_LANDMARKER):
+        if landmarker is not None:
+            close = getattr(landmarker, "close", None)
+            if callable(close):
+                close()
+
+    _HAND_LANDMARKER = None
+    _POSE_LANDMARKER = None
+
+
+def _get_landmarkers():
+    global _HAND_LANDMARKER, _POSE_LANDMARKER, _LANDMARKER_CLEANUP_REGISTERED
+
+    if _HAND_LANDMARKER is not None and _POSE_LANDMARKER is not None:
+        return _HAND_LANDMARKER, _POSE_LANDMARKER
+
+    with _LANDMARKER_LOCK:
+        if _HAND_LANDMARKER is not None and _POSE_LANDMARKER is not None:
+            return _HAND_LANDMARKER, _POSE_LANDMARKER
+
+        base_dir = os.path.join(os.path.dirname(__file__), "data", "mediapipe_tasks")
+        hand_task_path = _ensure_task_file(HAND_TASK_URL, os.path.join(base_dir, "hand_landmarker.task"))
+        pose_task_path = _ensure_task_file(POSE_TASK_URL, os.path.join(base_dir, "pose_landmarker_lite.task"))
+
+        hand_options = mp_vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=hand_task_path),
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_hands=2,
+        )
+        pose_options = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=pose_task_path),
+            running_mode=mp_vision.RunningMode.IMAGE,
+        )
+
+        _HAND_LANDMARKER = mp_vision.HandLandmarker.create_from_options(hand_options)
+        _POSE_LANDMARKER = mp_vision.PoseLandmarker.create_from_options(pose_options)
+
+        if not _LANDMARKER_CLEANUP_REGISTERED:
+            atexit.register(_close_landmarkers)
+            _LANDMARKER_CLEANUP_REGISTERED = True
+
+        return _HAND_LANDMARKER, _POSE_LANDMARKER
+
+
+def preload_landmarker_assets():
+    if mp is None or mp_python is None or mp_vision is None:
+        raise RuntimeError("mediapipe is required for landmark extraction")
+
+    _get_landmarkers()
+
+
 def normalize_single_frame(pose_xyz, left_hand_xyz, right_hand_xyz):
     pose = np.asarray(pose_xyz, dtype=np.float32).reshape(-1, 3).copy()
     left_hand = np.asarray(left_hand_xyz, dtype=np.float32).reshape(-1, 3).copy()
@@ -134,58 +195,63 @@ def normalize_single_frame(pose_xyz, left_hand_xyz, right_hand_xyz):
     return np.concatenate([pose.reshape(-1), left_hand.reshape(-1), right_hand.reshape(-1)], axis=0).astype(np.float32)
 
 
-def extract_landmark_sequence(video_path, max_frames=None):
+def extract_landmark_sequence(video_path, max_frames=12, frame_stride=8, max_side=320):
     if mp is None or mp_python is None or mp_vision is None:
         raise RuntimeError("mediapipe is required for landmark extraction")
-
-    base_dir = os.path.join(os.path.dirname(__file__), "data", "mediapipe_tasks")
-    hand_task_path = _ensure_task_file(HAND_TASK_URL, os.path.join(base_dir, "hand_landmarker.task"))
-    pose_task_path = _ensure_task_file(POSE_TASK_URL, os.path.join(base_dir, "pose_landmarker_lite.task"))
 
     frames = []
     cap = cv2.VideoCapture(video_path)
     try:
-        hand_options = mp_vision.HandLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=hand_task_path),
-            running_mode=mp_vision.RunningMode.IMAGE,
-            num_hands=2,
-        )
-        pose_options = mp_vision.PoseLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=pose_task_path),
-            running_mode=mp_vision.RunningMode.IMAGE,
-        )
+        hand_landmarker, pose_landmarker = _get_landmarkers()
+        frame_count = 0
+        frame_index = 0
+        frame_stride = max(1, int(frame_stride))
 
-        with mp_vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker, mp_vision.PoseLandmarker.create_from_options(pose_options) as pose_landmarker:
-            frame_count = 0
-            while True:
-                success, frame = cap.read()
-                if not success:
-                    break
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                hand_result = hand_landmarker.detect(image)
-                pose_result = pose_landmarker.detect(image)
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
 
-                pose_xyz = _landmarks_to_array(pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None, 33)
-                left_hand_xyz = np.zeros((21, 3), dtype=np.float32)
-                right_hand_xyz = np.zeros((21, 3), dtype=np.float32)
+            if frame_index % frame_stride != 0:
+                frame_index += 1
+                continue
 
-                if hand_result.hand_landmarks:
-                    for idx, hand_lms in enumerate(hand_result.hand_landmarks):
-                        handedness_name = None
-                        if hand_result.handedness and idx < len(hand_result.handedness) and len(hand_result.handedness[idx]) > 0:
-                            handedness_name = hand_result.handedness[idx][0].category_name.lower()
+            if max_side is not None:
+                height, width = frame.shape[:2]
+                longest_side = max(height, width)
+                if longest_side > max_side:
+                    scale = max_side / float(longest_side)
+                    resized_width = max(1, int(width * scale))
+                    resized_height = max(1, int(height * scale))
+                    frame = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
 
-                        coords = _landmarks_to_array(hand_lms, 21)
-                        if handedness_name == "left":
-                            left_hand_xyz = coords
-                        elif handedness_name == "right":
-                            right_hand_xyz = coords
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            hand_result = hand_landmarker.detect(image)
+            pose_result = pose_landmarker.detect(image)
 
-                frames.append(normalize_single_frame(pose_xyz, left_hand_xyz, right_hand_xyz))
-                frame_count += 1
-                if max_frames is not None and frame_count >= max_frames:
-                    break
+            pose_xyz = _landmarks_to_array(pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None, 33)
+            left_hand_xyz = np.zeros((21, 3), dtype=np.float32)
+            right_hand_xyz = np.zeros((21, 3), dtype=np.float32)
+
+            if hand_result.hand_landmarks:
+                for idx, hand_lms in enumerate(hand_result.hand_landmarks):
+                    handedness_name = None
+                    if hand_result.handedness and idx < len(hand_result.handedness) and len(hand_result.handedness[idx]) > 0:
+                        handedness_name = hand_result.handedness[idx][0].category_name.lower()
+
+                    coords = _landmarks_to_array(hand_lms, 21)
+                    if handedness_name == "left":
+                        left_hand_xyz = coords
+                    elif handedness_name == "right":
+                        right_hand_xyz = coords
+
+            frames.append(normalize_single_frame(pose_xyz, left_hand_xyz, right_hand_xyz))
+            frame_count += 1
+            if max_frames is not None and frame_count >= max_frames:
+                break
+
+            frame_index += 1
     finally:
         cap.release()
 
